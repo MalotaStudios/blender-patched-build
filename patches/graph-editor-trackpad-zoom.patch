@@ -1,20 +1,20 @@
 diff --git a/source/blender/editors/interface/view2d/view2d_ops.cc b/source/blender/editors/interface/view2d/view2d_ops.cc
-index 630c9cf..ae7c456 100644
+index 630c9cf..1e9ba58 100644
 --- a/source/blender/editors/interface/view2d/view2d_ops.cc
 +++ b/source/blender/editors/interface/view2d/view2d_ops.cc
-@@ -1200,6 +1200,12 @@ static wmOperatorStatus view_zoomdrag_invoke(bContext *C, wmOperator *op, const
-       facx = facy = zoomfac * WM_event_absolute_delta_x(event);
-     }
- 
-+    /* Malota patch: invert trackpad zoom so it matches the 3D Viewport. */
-+    if (!(U.uiflag & USER_NO_MULTITOUCH_GESTURES)) {
-+      facx *= -1.0f;
-+      facy *= -1.0f;
-+    }
+@@ -1195,6 +1195,12 @@ static wmOperatorStatus view_zoomdrag_invoke(bContext *C, wmOperator *op, const
+         facx *= -1.0f;
+         facy *= -1.0f;
+       }
 +
-     /* Only respect user setting zoom axis if the view does not have any zoom restrictions
-      * any will be scaled uniformly. */
-     if (((v2d->keepzoom & (V2D_LOCKZOOM_X | V2D_LOCKZOOM_Y)) == 0) &&
++      /* Malota patch: invert trackpad zoom so it matches the 3D Viewport. */
++      if (!(U.uiflag & USER_NO_MULTITOUCH_GESTURES)) {
++        facx *= -1.0f;
++        facy *= -1.0f;
++      }
+     }
+     else { /* MOUSEZOOM */
+       facx = facy = zoomfac * WM_event_absolute_delta_x(event);
 @@ -1356,6 +1362,12 @@ static wmOperatorStatus view_zoomdrag_modal(bContext *C, wmOperator *op, const w
        dy *= -1.0f;
      }

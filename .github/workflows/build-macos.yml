@@ -1,0 +1,356 @@
+name: Build macOS Blender
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-macos.yml"
+      - "patches/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-macos-blender-5.3.0
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS arm64 Blender 5.3.0
+    runs-on: macos-15
+    timeout-minutes: 355
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 5G
+      CCACHE_BASEDIR: ${{ github.workspace }}/blender
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v4
+
+      - name: Select newest non-beta Xcode
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import os, plistlib, re, subprocess, sys
+          from pathlib import Path
+
+          MIN = (16, 3)
+
+          def version_tuple(text):
+              match = re.search(r"(\d+(?:\.\d+)+)", text)
+              if not match:
+                  return None
+              return tuple(int(part) for part in match.group(1).split("."))
+
+          def is_prerelease(text):
+              return re.search(r"beta|preview|release[\s_-]*candidate|\brc\d*\b", text, re.I) is not None
+
+          resolved_apps = {}
+          for app in sorted(Path("/Applications").glob("Xcode*.app")):
+              try:
+                  resolved = app.resolve()
+              except OSError as exc:
+                  print(f"skip {app}: {exc}")
+                  continue
+              resolved_apps.setdefault(resolved, app)
+
+          candidates = []
+          for resolved, app in resolved_apps.items():
+              names = f"{resolved.name} {app.name}"
+              if is_prerelease(names):
+                  print(f"skip prerelease name: {resolved}")
+                  continue
+              version_text = ""
+              plist_path = resolved / "Contents" / "version.plist"
+              if plist_path.is_file():
+                  with plist_path.open("rb") as handle:
+                      info = plistlib.load(handle)
+                  version_text = str(info.get("CFBundleShortVersionString", ""))
+              if not version_text or is_prerelease(version_text):
+                  env = os.environ.copy()
+                  env["DEVELOPER_DIR"] = str(resolved / "Contents" / "Developer")
+                  try:
+                      output = subprocess.check_output(
+                          ["xcodebuild", "-version"],
+                          env=env,
+                          text=True,
+                          stderr=subprocess.STDOUT,
+                      )
+                  except subprocess.CalledProcessError as exc:
+                      print(f"skip {resolved}: xcodebuild failed\n{exc.output}")
+                      continue
+                  first = output.splitlines()[0] if output else ""
+                  if is_prerelease(first):
+                      print(f"skip prerelease version: {first} ({resolved})")
+                      continue
+                  version_text = first
+              if is_prerelease(version_text):
+                  print(f"skip prerelease version string: {version_text} ({resolved})")
+                  continue
+              version = version_tuple(version_text)
+              if version is None:
+                  print(f"skip unparsed version: {version_text} ({resolved})")
+                  continue
+              if version < MIN:
+                  print(f"skip Xcode {version_text} < 16.3 at {resolved}")
+                  continue
+              print(f"candidate: Xcode {version_text} at {resolved}")
+              candidates.append((version, resolved, version_text))
+
+          if not candidates:
+              sys.exit("No non-beta Xcode >= 16.3 found")
+
+          candidates.sort()
+          _version, selected, version_text = candidates[-1]
+          developer_dir = selected / "Contents" / "Developer"
+          print(f"SELECTED Xcode {version_text} at {selected}")
+          Path("/tmp/selected-xcode-app").write_text(str(selected))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"DEVELOPER_DIR={developer_dir}\n")
+              handle.write(f"SELECTED_XCODE_VERSION={version_text}\n")
+          PY
+          DEVELOPER_DIR="$(cat /tmp/selected-xcode-app)/Contents/Developer"
+          export DEVELOPER_DIR
+          sudo xcode-select -s "$DEVELOPER_DIR"
+          sudo xcodebuild -license accept || true
+          xcodebuild -version
+          xcrun --find clang
+          xcrun clang --version
+
+      - name: Free disk (other Xcodes)
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h /
+          python3 - << 'PY'
+          import subprocess
+          from pathlib import Path
+          selected = Path(Path("/tmp/selected-xcode-app").read_text().strip()).resolve()
+          print(f"keeping {selected}")
+          for app in sorted(Path("/Applications").glob("Xcode*.app")):
+              try:
+                  same = app.resolve() == selected
+              except OSError:
+                  same = False
+              if same:
+                  print(f"keep {app}")
+                  continue
+              print(f"remove {app}")
+              subprocess.check_call(["sudo", "rm", "-rf", str(app)])
+          PY
+          # Simulator runtimes live outside Xcode.app and are not needed to compile Blender.
+          xcrun simctl delete all || true
+          xcrun simctl runtime delete all || true
+          sudo rm -rf \
+            "$HOME/Library/Developer/CoreSimulator" \
+            /Library/Developer/CoreSimulator
+          echo "Disk after removing other Xcodes and simulators:"
+          df -h / "$GITHUB_WORKSPACE"
+          avail_kb="$(df -k "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
+          echo "Workspace available KiB: ${avail_kb}"
+          if [ "${avail_kb}" -lt 41943040 ]; then
+            echo "Under 40GiB free on the workspace volume; removing the Android SDK."
+            rm -rf "$HOME/Library/Android" /usr/local/lib/android || true
+            df -h / "$GITHUB_WORKSPACE"
+          fi
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_ENV_HINTS=1
+          brew install ninja ccache coreutils git-lfs
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          export PATH="/opt/homebrew/bin:$PATH"
+          command -v ninja
+          command -v ccache
+          command -v gtimeout
+          command -v git
+          git lfs install --skip-repo
+          ninja --version
+          ccache --version | head -n 1
+          gtimeout --version | head -n 1
+          git lfs version
+
+      - name: Shallow clone Blender v5.3.0 and init macOS libraries
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          git clone --depth 1 --branch v5.3.0 https://projects.blender.org/blender/blender.git blender
+          cd blender
+          git config submodule.lib/macos_arm64.update checkout
+          if ! GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 --progress lib/macos_arm64; then
+            echo "Shallow submodule init failed; cloning the pinned blender-v5.3-release tip."
+            rm -rf lib/macos_arm64 .git/modules/lib/macos_arm64
+            GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --branch blender-v5.3-release \
+              https://projects.blender.org/blender/lib-macos_arm64.git lib/macos_arm64
+          fi
+          git -C lib/macos_arm64 rev-parse HEAD
+          git lfs pull
+          git -C lib/macos_arm64 lfs pull
+          test -e lib/macos_arm64/.git
+          test -f lib/macos_arm64/ffmpeg/lib/libavcodec.a
+          python3 - << 'PY'
+          from pathlib import Path
+          data = Path("lib/macos_arm64/ffmpeg/lib/libavcodec.a").read_bytes()[:200]
+          if b"git-lfs" in data:
+              raise SystemExit("libavcodec.a is still a Git LFS pointer")
+          print("Library checkout is smudged.")
+          PY
+          df -h /
+
+      - name: Free disk (LFS object copies)
+        working-directory: blender
+        run: |
+          set -euo pipefail
+          echo "LFS object copies before cleanup:"
+          du -sh .git/lfs .git/modules/lib/macos_arm64/lfs lib/macos_arm64/.git/lfs 2>/dev/null || true
+          rm -rf .git/lfs
+          rm -rf .git/modules/lib/macos_arm64/lfs
+          if [ -d lib/macos_arm64/.git ]; then
+            rm -rf lib/macos_arm64/.git/lfs
+          fi
+          echo "Disk after dropping LFS object copies:"
+          df -h /
+
+      - name: Apply trackpad zoom patch
+        working-directory: blender
+        run: |
+          set -euo pipefail
+          git apply --check "$GITHUB_WORKSPACE/patches/graph-editor-trackpad-zoom.patch"
+          git apply "$GITHUB_WORKSPACE/patches/graph-editor-trackpad-zoom.patch"
+          echo "==== Malota patch applied ===="
+          grep -n -C 2 "Malota patch" source/blender/editors/interface/view2d/view2d_ops.cc
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-arm64-blender-5.3.0-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-macos-arm64-blender-5.3.0-${{ github.run_id }}-
+            ccache-macos-arm64-blender-5.3.0-
+
+      - name: Configure
+        working-directory: blender
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          mkdir -p "$CCACHE_DIR" build
+          ccache --zero-stats || true
+          ccache -p || true
+          cd build
+          cmake -G Ninja \
+            -C ../build_files/cmake/config/blender_release.cmake \
+            -DWITH_COMPILER_CCACHE=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            ..
+          echo "Disk after configure:"
+          df -h /
+
+      - name: Build and install
+        working-directory: blender/build
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:$PATH"
+          gtimeout --signal=TERM --kill-after=60s 300m ninja install
+          ccache -s || true
+          test -d bin/Blender.app
+          echo "Disk after install:"
+          df -h /
+
+      - name: Ad-hoc codesign
+        working-directory: blender/build
+        run: |
+          set -euo pipefail
+          codesign --force --deep -s - bin/Blender.app
+          codesign --verify --deep --verbose=2 bin/Blender.app
+
+      - name: Create UDZO disk image
+        run: |
+          set -euo pipefail
+          echo "Dropping compile products so hdiutil has room"
+          find "$GITHUB_WORKSPACE/blender/build" \
+            -path "$GITHUB_WORKSPACE/blender/build/bin/Blender.app" -prune \
+            -o -type f \( -name '*.o' -o -name '*.a' \) -delete
+          rm -rf "$GITHUB_WORKSPACE/blender/lib"
+          df -h /
+          STAGE="$RUNNER_TEMP/blender-dmg-root"
+          DIST="$GITHUB_WORKSPACE/dist"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE" "$DIST"
+          cp -R "$GITHUB_WORKSPACE/blender/build/bin/Blender.app" "$STAGE/Blender.app"
+          ln -s /Applications "$STAGE/Applications"
+          DMG="$DIST/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg"
+          rm -f "$DMG"
+          for attempt in 1 2 3; do
+            if hdiutil create -volname "Blender 5.3.0" -srcfolder "$STAGE" -ov -format UDZO "$DMG"; then
+              break
+            fi
+            echo "hdiutil failed (attempt ${attempt})"
+            rm -f "$DMG"
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 15
+          done
+          (
+            cd "$DIST"
+            shasum -a 256 "blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg" \
+              | tee "blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg.sha256"
+          )
+          ls -lh "$DIST"
+
+      - name: Upload disk image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-5.3.0-macos-arm64-trackpad-zoom-r${{ github.run_number }}
+          path: |
+            dist/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg
+            dist/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="$(awk '{print $1}' dist/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg.sha256)"
+          TAG="v5.3.0-trackpad-zoom-r${GITHUB_RUN_NUMBER}"
+          NOTES=$(cat <<EOF
+          Blender 5.3.0 for macOS Apple Silicon (arm64), built from tag v5.3.0 with the trackpad zoom patch.
+
+          This build is ad-hoc signed, not notarized. Right-click > Open the first time, or:
+
+          xattr -dr com.apple.quarantine /Applications/Blender.app
+
+          SHA256: ${SHA}
+          EOF
+          )
+          gh release create "$TAG" \
+            "dist/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg" \
+            "dist/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg.sha256" \
+            --title "Blender 5.3.0 macOS arm64 trackpad zoom r${GITHUB_RUN_NUMBER}" \
+            --notes "$NOTES"
+          echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          echo "DMG: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/blender-5.3.0-macos-arm64-trackpad-zoom-patch.dmg"
+
+      - name: Free build tree
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/blender"
+          df -h /
+
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-arm64-blender-5.3.0-${{ github.run_id }}-${{ github.run_attempt }}
