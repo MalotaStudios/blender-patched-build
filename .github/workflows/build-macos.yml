@@ -142,12 +142,22 @@ jobs:
               print(f"remove {app}")
               subprocess.check_call(["sudo", "rm", "-rf", str(app)])
           PY
-          # Simulator runtimes live outside Xcode.app and are not needed to compile Blender.
+          # Simulator runtimes are mounted read-only under CoreSimulator/Volumes.
+          # Unmount them when possible, and never fail the job if a volume stays busy:
+          # removing the other Xcode apps is what frees the space Blender needs.
           xcrun simctl delete all || true
           xcrun simctl runtime delete all || true
-          sudo rm -rf \
-            "$HOME/Library/Developer/CoreSimulator" \
-            /Library/Developer/CoreSimulator
+          if mount | grep -q CoreSimulator; then
+            echo "Mounted CoreSimulator volumes:"
+            mount | grep CoreSimulator || true
+            while read -r dev mountpoint; do
+              echo "Unmounting ${mountpoint} (${dev})"
+              sudo diskutil unmount force "$mountpoint" || true
+              sudo hdiutil detach "$dev" -force || true
+            done < <(mount | awk '/CoreSimulator/ {print $1, $3}')
+          fi
+          rm -rf "$HOME/Library/Developer/CoreSimulator" || true
+          sudo rm -rf /Library/Developer/CoreSimulator || echo "Left read-only CoreSimulator mounts in place."
           echo "Disk after removing other Xcodes and simulators:"
           df -h / "$GITHUB_WORKSPACE"
           avail_kb="$(df -k "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
